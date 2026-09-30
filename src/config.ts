@@ -17,6 +17,7 @@ export type ExtensionConfig = {
   thresholdRatio?: number;
   notify?: boolean;
   usePreviousResponseId?: boolean;
+  useCustomTransport?: boolean;
 };
 
 export function isRecord(value: unknown): value is JsonRecord {
@@ -53,7 +54,8 @@ function toPositiveNumber(value: unknown): number | undefined {
 }
 
 export function loadConfig(cwd: string): Required<ExtensionConfig> {
-  const globalPath = join(homedir(), ".pi", "agent", "openai-server-compaction.json");
+  const agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
+  const globalPath = join(agentDir, "openai-server-compaction.json");
   const projectPath = join(cwd, ".pi", "openai-server-compaction.json");
   const globalCfg = readJsonFile(globalPath) ?? {};
   const projectCfg = readJsonFile(projectPath) ?? {};
@@ -79,6 +81,10 @@ export function loadConfig(cwd: string): Required<ExtensionConfig> {
     notify:
       toBoolean(process.env.PI_OPENAI_SERVER_COMPACTION_NOTIFY) ??
       toBoolean(merged.notify) ??
+      false,
+    useCustomTransport:
+      toBoolean(process.env.PI_OPENAI_SERVER_COMPACTION_CUSTOM_TRANSPORT) ??
+      toBoolean(merged.useCustomTransport) ??
       false,
     usePreviousResponseId:
       toBoolean(process.env.PI_OPENAI_SERVER_COMPACTION_PREVIOUS_RESPONSE_ID) ??

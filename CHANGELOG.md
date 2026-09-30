@@ -1,3 +1,18 @@
+# Compatibility fork 0.1.2 (2026-09-30)
+
+- Preserve Pi context messages and unanswered turns, adapting upstream PR #18 by kunchenguid.
+- Reconcile persisted history before provider requests and compaction, adapting upstream PR #19 by Christian-Martensson.
+- Report combined summary and remote usage to Pi, adapting upstream PR #15 by ronind.
+- Publish the fork with 17 offline checks and live extension-note, repeated-compaction, and resume coverage.
+
+# Compatibility patch 0.1.1 (2026-09-30)
+
+- Support Pi 0.99.1 with native transport and stateless request history.
+- Use inline encrypted compaction for direct OpenAI subscription OAuth, whose hardened boundary rejected the original compaction trigger and standalone compact route in live probes.
+- Preserve current system instructions and tool definitions during native remote-history replay.
+- Use authenticated model-registry completion for portable summaries and report provider failures accurately.
+- Add readiness command and offline/live compatibility regressions.
+
 # Changelog
 
 This changelog intentionally starts at **0.1.0**.

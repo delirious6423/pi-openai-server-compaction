@@ -4,7 +4,7 @@
  * Wires together request patching, remote compaction, runtime state
  * reconstruction, session lifecycle cleanup, and provider override registration.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { CompactionResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { isRecord, loadConfig } from "./config.ts";
 import { streamOpenAIResponsesWithPhase2B } from "./custom-stream.ts";
@@ -25,6 +25,8 @@ import {
 import { releaseAllWsSessions, releaseWsSession } from "./openai-ws-stream.ts";
 import {
   buildCompactionSummaryText,
+  branchEntryToContextMessage,
+  combineCompactionUsage,
   buildRemoteCompactionDetails,
   buildToolsPayload,
   callRemoteCompactionEndpoint,
@@ -69,9 +71,10 @@ function getSessionId(ctx: SessionContextLike): string {
 }
 
 function getBranchMessages(branchEntries: BranchEntry[]): AgentMessage[] {
-  return branchEntries.flatMap((entry) =>
-    entry.type === "message" && entry.message ? [entry.message as AgentMessage] : [],
-  );
+  return branchEntries.flatMap((entry) => {
+    const message = branchEntryToContextMessage(entry);
+    return message ? [message] : [];
+  });
 }
 
 function getBranchMessageCount(branchEntries: BranchEntry[]): number {
@@ -98,9 +101,8 @@ function clearSessionRuntimeState(sessionId: string | undefined): void {
   clearResponsesRequestShapeState(sessionId);
 }
 
-function syncRemoteState(ctx: SessionContextLike): void {
-  const sessionId = getSessionId(ctx);
-  const branchEntries = ctx.sessionManager.getBranch() as Array<{
+function syncRemoteStateFromBranch(sessionId: string, entries: BranchEntry[]): void {
+  const branchEntries = entries as Array<{
     type: string;
     id: string;
     details?: unknown;
@@ -112,6 +114,10 @@ function syncRemoteState(ctx: SessionContextLike): void {
   } else {
     clearRemoteCompactionState(sessionId);
   }
+}
+
+function syncRemoteState(ctx: SessionContextLike): void {
+  syncRemoteStateFromBranch(getSessionId(ctx), ctx.sessionManager.getBranch());
 }
 
 function getMatchingRemoteState(
@@ -164,10 +170,33 @@ function maybeNotifyRequestFeatures(params: {
 export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
   const notifiedModels = new Set<string>();
 
-  pi.registerProvider("openai", {
-    api: "openai-responses",
-    streamSimple: streamOpenAIResponsesWithPhase2B,
+  pi.registerCommand("openai-compaction-status", {
+    description: "Show compaction readiness, transport, and loaded remote history",
+    handler: async (_args, ctx) => {
+      const cfg = loadConfig(ctx.cwd);
+      const supported = cfg.enabled && ctx.model && supportsRemoteCompactionModel(ctx.model);
+      const subscription = ctx.model && ctx.modelRegistry.isUsingOAuth(ctx.model);
+      const remoteState = getMatchingRemoteState(getSessionId(ctx), ctx.model);
+      const protocol = subscription && ctx.model && !isOpenAICodexResponsesModel(ctx.model)
+        ? "inline server compaction (ChatGPT subscription)"
+        : "Responses compaction v2";
+      ctx.ui.notify(
+        `OpenAI compaction: ${supported ? "ready" : "disabled or unsupported model"}; ` +
+        `${protocol}; transport: ${cfg.useCustomTransport && !subscription ? "custom WebSocket" : "Pi native"}; ` +
+        `remote history: ${remoteState ? "loaded" : "none yet"}.`,
+        "info",
+      );
+    },
   });
+
+  // Pi owns the normal transport, normalized prompt, auth, and tools by default.
+  // The legacy custom WebSocket path is an explicit API-key-only opt-in.
+  if (loadConfig(process.cwd()).useCustomTransport) {
+    pi.registerProvider("openai", {
+      api: "openai-responses",
+      streamSimple: streamOpenAIResponsesWithPhase2B,
+    });
+  }
 
   pi.on("session_start", (_event, ctx) => {
     const sessionId = getSessionId(ctx);
@@ -207,9 +236,14 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (!auth.ok || !auth.apiKey) return undefined;
 
+    const headers = Object.fromEntries(
+      Object.entries(auth.headers ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    );
     const tools = buildToolsPayload(pi.getAllTools(), pi.getActiveTools());
     const sessionId = getSessionId(ctx);
     const branchEntries = event.branchEntries as BranchEntry[];
+    // PR #19: the persisted branch is authoritative even if message_end was missed.
+    syncRemoteStateFromBranch(sessionId, branchEntries);
     const remoteState = getMatchingRemoteState(sessionId, model);
     const observedRequestShape = getResponsesRequestShapeState(sessionId);
     const fullBranchMessages = getBranchMessages(branchEntries);
@@ -230,7 +264,9 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
         messages: fullBranchMessages,
         model,
         apiKey: auth.apiKey,
-        headers: auth.headers,
+        headers,
+        completeFn: (targetModel, context, options) => ctx.modelRegistry.complete(targetModel, context, options),
+        streamFn: (targetModel, context, options) => ctx.modelRegistry.streamSimple(targetModel, context, options),
         customInstructions: event.customInstructions,
         signal: event.signal,
         thinkingLevel,
@@ -240,8 +276,9 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
       callRemoteCompactionEndpoint({
         model,
         apiKey: auth.apiKey,
-        headers: auth.headers,
+        headers,
         sessionId,
+        subscriptionAuth: ctx.modelRegistry.isUsingOAuth(model),
         input: promptResponseItems,
         instructions: ctx.getSystemPrompt(),
         tools,
@@ -253,12 +290,12 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
     ]);
 
     if (remoteResult.status !== "fulfilled") {
-      if (localResult.status === "fulfilled") {
-        return { compaction: localResult.value };
-      }
       if (!event.signal.aborted && ctx.hasUI) {
         const message = remoteResult.reason instanceof Error ? remoteResult.reason.message : String(remoteResult.reason);
         ctx.ui.notify(`OpenAI remote compaction failed; falling back to default compaction. ${message}`, "warning");
+      }
+      if (localResult.status === "fulfilled") {
+        return { compaction: localResult.value };
       }
       return undefined;
     }
@@ -267,8 +304,9 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
       model,
       remoteResult.value.output,
       remoteResult.value.usage,
+      remoteResult.value.implementation,
     );
-    const localSummary =
+    const localSummary: CompactionResult =
       localResult.status === "fulfilled"
         ? localResult.value
         : {
@@ -282,6 +320,7 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
         summary: localSummary.summary,
         firstKeptEntryId: localSummary.firstKeptEntryId,
         tokensBefore: localSummary.tokensBefore,
+        usage: combineCompactionUsage(localSummary.usage, remoteResult.value.usage),
         details: {
           ...(localSummary.details !== undefined ? { localSummaryDetails: localSummary.details } : {}),
           remoteCompaction: remoteDetails,
@@ -301,7 +340,8 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
     });
 
     const cfg = loadConfig(ctx.cwd);
-    if (!cfg.enabled || !supportsPreviousResponseId(model, cfg)) return;
+    if (!cfg.enabled || !cfg.useCustomTransport || !supportsPreviousResponseId(model, cfg)) return;
+    if (model && ctx.modelRegistry.isUsingOAuth(model)) return;
     if (!messageMatchesModel(event.message, model)) return;
 
     const responseId = extractAssistantResponseId(event.message);
@@ -328,6 +368,7 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
       reasoning: extractResponsesReasoningConfig(event.payload),
       text: extractResponsesTextConfig(event.payload),
     });
+    syncRemoteState(ctx);
     const remoteState = getMatchingRemoteState(sessionId, model);
 
     if (isOpenAICodexResponsesModel(model)) {
@@ -355,14 +396,24 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
         ? continuation.responseId
         : undefined;
 
-    const payload = applyPayloadPatch({
+    const stateless = !cfg.useCustomTransport || ctx.modelRegistry.isUsingOAuth(model);
+    let payload = applyPayloadPatch({
       payload: event.payload,
       model,
       cfg,
       previousResponseId,
+      stateless,
+      contextManagement: cfg.useCustomTransport && !stateless,
     });
+    if (remoteState) {
+      payload = applyRemoteHistoryPayloadPatch({
+        payload,
+        explicitHistory: normalizeResponseItemsForPrompt(remoteState.explicitHistory, model) as unknown[],
+      });
+    }
 
-    const features = ["store=true", "context_management"];
+    const features = [stateless ? "store=false" : "store=true"];
+    if (payload.context_management) features.push("context_management");
     if (remoteState !== undefined) {
       features.push("remote_compaction_history");
     } else if (previousResponseId) {

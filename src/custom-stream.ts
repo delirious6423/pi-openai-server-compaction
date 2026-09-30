@@ -10,6 +10,7 @@ import type {
   Model,
   StreamFunction,
 } from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import { streamSimpleOpenAIResponses } from "@earendil-works/pi-ai/compat";
 import { createOpenAIWebSocketStreamFn } from "./openai-ws-stream.ts";
 import { loadConfig } from "./config.ts";
@@ -23,12 +24,19 @@ export const streamOpenAIResponsesWithPhase2B: StreamFunction = (
   options,
 ) => {
   const cfg = loadConfig(process.cwd());
-  if (!cfg.enabled || !isDirectOpenAIResponsesModel(model)) {
+  // OAuth subscription tokens use Pi's auth-aware built-in transport.
+  const subscriptionToken = options?.apiKey?.startsWith("eyJ") === true;
+  if (!cfg.enabled || !cfg.useCustomTransport || subscriptionToken || !isDirectOpenAIResponsesModel(model)) {
     return streamSimpleOpenAIResponses(
       model as Model<"openai-responses">,
-      context as Context,
+      context,
       options as SimpleStreamOptions | undefined,
     );
   }
-  return websocketStream(model, context, options);
+  const legacyContext: Context = {
+    systemPrompt: getCurrentSystemPrompt(context.messages),
+    tools: getCurrentTools(context.messages),
+    messages: context.messages.filter((message) => message.role !== "system"),
+  };
+  return websocketStream(model, legacyContext, options);
 };

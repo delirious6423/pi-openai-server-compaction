@@ -2,7 +2,7 @@
  * Codex-style remote compaction helpers.
  *
  * Converts Pi messages into OpenAI Responses items, requests remote compaction
- * through the Responses API's `compaction_trigger`, stores the returned opaque
+ * through inline subscription compaction or `compaction_trigger`, stores opaque
  * replacement history, and reconstructs replayable state from persisted Pi
  * session entries.
  */
@@ -12,14 +12,16 @@ import { arch, platform, release } from "node:os";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { SessionBeforeCompactEvent, ToolInfo } from "@earendil-works/pi-coding-agent";
-import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
   compact,
   convertToLlm,
   serializeConversation,
+  sessionEntryToContextMessages,
   type CompactionResult,
+  type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { calculateCost, type Model, type Usage } from "@earendil-works/pi-ai";
+import { calculateCost, type AssistantMessage, type Context, type SimpleStreamOptions, type Model, type Usage } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
 import { isRecord } from "./config.ts";
 import {
@@ -87,7 +89,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 export type RemoteCompactionDetails = {
   version: 1 | 2;
   provider: "openai-responses-compact" | "openai-responses-compaction";
-  implementation?: "responses_compact_v1" | "responses_compaction_v2";
+  implementation?: "responses_compact_v1" | "responses_compaction_v2" | "responses_inline_compaction";
   modelKey: string;
   replacementHistory: ResponseItem[];
   usage?: RemoteCompactionUsageSnapshot;
@@ -101,9 +103,32 @@ export type RemoteCompactionSessionState = {
 };
 
 export type RemoteCompactionResult = {
+  implementation?: RemoteCompactionDetails["implementation"];
   output: ResponseItem[];
   usage?: RemoteCompactionUsageSnapshot;
 };
+
+// Adapted from upstream PR #15 (ronind). Pi 0.99 persists this top-level usage.
+export function combineCompactionUsage(...usages: Array<Usage | undefined>): Usage | undefined {
+  const present = usages.filter((usage): usage is Usage => usage !== undefined);
+  if (present.length === 0) return undefined;
+  const combined: Usage = {
+    input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  for (const usage of present) {
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) {
+      combined[key] += usage[key];
+    }
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) {
+      combined.cost[key] += usage.cost[key];
+    }
+    for (const key of ["cacheWrite1h", "reasoning"] as const) {
+      if (usage[key] !== undefined) combined[key] = (combined[key] ?? 0) + usage[key];
+    }
+  }
+  return combined;
+}
 
 function normalizeBaseUrl(baseUrl: string | undefined, fallback: string): string {
   const trimmed = baseUrl?.trim();
@@ -417,6 +442,15 @@ export function messageToResponseItems(message: AgentMessage): ResponseItem[] {
       call_id: message.toolCallId.split("|", 1)[0],
       output: toolResultContentToOutput(message.content),
     });
+    return items;
+  }
+
+  // PR #18 (kunchenguid): use Pi's own conversion for injected context,
+  // bash output, and branch/compaction summaries rather than dropping them.
+  const [flattened] = convertToLlm([message]);
+  if (flattened?.role === "user") {
+    const content = contentToResponseContentItems(flattened.content);
+    if (content.length > 0) items.push({ type: "message", role: "user", content });
   }
 
   return items;
@@ -648,7 +682,7 @@ export function buildRemoteCompactionV2History(
   input: ResponseItem[],
   compactionItem: ResponseItem,
 ): ResponseItem[] {
-  if (compactionItem.type !== "compaction") {
+  if (compactionItem.type !== "compaction" && compactionItem.type !== "compaction_summary") {
     throw new Error("OpenAI remote compaction v2 did not return a compaction item.");
   }
   const retainedUserMessages = input.filter(
@@ -678,6 +712,7 @@ export function buildToolsPayload(
 }
 
 export async function generatePortableSummary(params: {
+  completeFn?: (model: Model<any>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
   messages: AgentMessage[];
   model: Model<any>;
   apiKey: string;
@@ -688,7 +723,7 @@ export async function generatePortableSummary(params: {
   tokensBefore: number;
 }): Promise<CompactionResult> {
   const conversation = serializeConversation(convertToLlm(params.messages));
-  const response = await complete(
+  const response = await (params.completeFn ?? complete)(
     params.model,
     {
       messages: [
@@ -707,6 +742,9 @@ export async function generatePortableSummary(params: {
     },
   );
 
+  if (response.stopReason === "error" || response.stopReason === "aborted") {
+    throw new Error(response.errorMessage || `Portable summary ${response.stopReason}`);
+  }
   const summary = response.content
     .filter((item): item is { type: "text"; text: string } => item.type === "text")
     .map((item) => item.text)
@@ -717,10 +755,13 @@ export async function generatePortableSummary(params: {
     summary: summary || buildCompactionSummaryText(params.model),
     firstKeptEntryId: params.firstKeptEntryId,
     tokensBefore: params.tokensBefore,
+    usage: response.usage,
   };
 }
 
 export async function generateBestEffortLocalSummary(params: {
+  completeFn?: (model: Model<any>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
+  streamFn?: StreamFn;
   preparation: CompactionPreparation;
   messages: AgentMessage[];
   model: Model<any>;
@@ -743,6 +784,7 @@ export async function generateBestEffortLocalSummary(params: {
       params.customInstructions,
       params.signal,
       params.thinkingLevel,
+      params.streamFn,
     );
   }
 }
@@ -916,11 +958,12 @@ export function parseRemoteCompactionV2Events(events: unknown[]): RemoteCompacti
   return { compactionItem: compactionItems[0], usage };
 }
 
-export async function callRemoteCompactionEndpoint(params: {
+export type RemoteCompactionParams = {
   model: Model<any>;
   apiKey: string;
   headers?: Record<string, string>;
   sessionId?: string;
+  subscriptionAuth?: boolean;
   input: ResponseItem[];
   instructions?: string;
   tools: Record<string, unknown>[];
@@ -928,9 +971,71 @@ export async function callRemoteCompactionEndpoint(params: {
   reasoning?: ResponsesReasoningConfig;
   text?: ResponsesTextConfig;
   signal?: AbortSignal;
-}): Promise<RemoteCompactionResult> {
+};
+
+export function parseInlineCompactionEvents(events: unknown[]): RemoteCompactionV2Events {
+  let completed = false;
+  let usage: unknown;
+  let compactionItem: ResponseItem | undefined;
+  for (const event of events) {
+    if (!isRecord(event)) continue;
+    if (event.type === "error" || event.type === "response.failed") {
+      const response = isRecord(event.response) ? event.response : undefined;
+      const error = response && isRecord(response.error) ? response.error : undefined;
+      throw new Error(String(event.message ?? error?.message ?? "Inline compaction failed"));
+    }
+    if (event.type === "response.output_item.done" && isResponseItem(event.item)) {
+      if ((event.item.type === "compaction" || event.item.type === "compaction_summary") &&
+          typeof event.item.encrypted_content === "string") {
+        // Inline compaction may run before and after generation; the last artifact
+        // carries the newest state. Do not require exactly one item as v2 does.
+        compactionItem = event.item;
+      }
+    }
+    if (event.type === "response.completed") {
+      completed = true;
+      const response = isRecord(event.response) ? event.response : undefined;
+      usage = response?.usage;
+    }
+  }
+  if (!completed) throw new Error("Inline compaction ended before response.completed.");
+  if (!compactionItem) throw new Error("Inline compaction returned no encrypted artifact; retaining the portable summary.");
+  return { compactionItem, usage };
+}
+
+async function callInlineCompactionEndpoint(params: RemoteCompactionParams): Promise<RemoteCompactionResult> {
+  const body = buildRemoteCompactionRequestBody(params);
+  // Sign in with ChatGPT rejects compaction_trigger and /responses/compact.
+  // Its normal Responses route accepts documented context_management instead.
+  body.input = params.input;
+  body.context_management = [{ type: "compaction", compact_threshold: 1000 }];
+  body.tool_choice = "none";
+  body.instructions = `${params.instructions ?? ""}\nThis is a context-compaction maintenance request. Do not call tools. Reply only COMPACTION_OK.`;
+  const response = await fetch(remoteCompactionV2EndpointUrl(params.model), {
+    method: "POST",
+    headers: buildRemoteCompactionHeaders(params),
+    body: JSON.stringify(body),
+    signal: params.signal,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`OpenAI inline compaction failed (${response.status}): ${text || response.statusText}`);
+  }
+  const parsed = parseInlineCompactionEvents(parseSseData(await response.text()));
+  return {
+    implementation: "responses_inline_compaction",
+    output: buildRemoteCompactionV2History(params.input, parsed.compactionItem),
+    usage: extractRemoteCompactionUsage(params.model, parsed.usage),
+  };
+}
+
+export async function callRemoteCompactionEndpoint(params: RemoteCompactionParams): Promise<RemoteCompactionResult> {
   if (!supportsRemoteCompactionModel(params.model)) {
     throw new Error("Remote compaction v2 is currently only enabled for supported OpenAI-compatible Responses models.");
+  }
+
+  if (params.subscriptionAuth && isDirectOpenAIResponsesModel(params.model)) {
+    return callInlineCompactionEndpoint(params);
   }
 
   const response = await fetch(remoteCompactionV2EndpointUrl(params.model), {
@@ -971,11 +1076,12 @@ export function buildRemoteCompactionDetails(
   model: Model<any>,
   replacementHistory: ResponseItem[],
   usage?: RemoteCompactionUsageSnapshot,
+  implementation: RemoteCompactionDetails["implementation"] = "responses_compaction_v2",
 ): RemoteCompactionDetails {
   return {
     version: 2,
     provider: "openai-responses-compaction",
-    implementation: "responses_compaction_v2",
+    implementation,
     modelKey: modelKey(model),
     replacementHistory,
     ...(usage ? { usage } : {}),
@@ -1002,7 +1108,9 @@ export function extractRemoteCompactionDetails(details: unknown):
   return {
     version: isV2 ? 2 : 1,
     provider: isV2 ? "openai-responses-compaction" : "openai-responses-compact",
-    implementation: isV2 ? "responses_compaction_v2" : "responses_compact_v1",
+    implementation: isV2
+      ? remote.implementation === "responses_inline_compaction" ? "responses_inline_compaction" : "responses_compaction_v2"
+      : "responses_compact_v1",
     modelKey: typeof remote.modelKey === "string" ? remote.modelKey : "",
     replacementHistory,
     ...(usage ? { usage } : {}),
@@ -1023,8 +1131,16 @@ function assistantMessageMatchesModelKey(
 ): boolean {
   const target = parseModelKeyParts(targetModelKey);
   if (!target) return false;
-  if (!isRecord(message)) return false;
-  return message.provider === target.provider && message.model === target.id;
+  const descriptor: unknown = message;
+  if (!isRecord(descriptor)) return false;
+  return descriptor.provider === target.provider && descriptor.model === target.id;
+}
+
+// Pi 0.99 exports its entry converter; delegate instead of maintaining a mirror.
+// The latest compaction artifact itself is handled separately during reconstruction.
+export function branchEntryToContextMessage(entry: { type: string; message?: unknown }): AgentMessage | undefined {
+  if (entry.type === "compaction") return undefined;
+  return sessionEntryToContextMessages(entry as SessionEntry)[0];
 }
 
 export function reconstructRemoteCompactionStateFromBranch(params: {
@@ -1047,13 +1163,14 @@ export function reconstructRemoteCompactionStateFromBranch(params: {
   let pendingTurnItems: ResponseItem[] = [];
 
   for (const entry of params.branchEntries.slice(latestCompactionIndex + 1)) {
-    if (entry.type !== "message" || !entry.message) continue;
+    const message = branchEntryToContextMessage(entry);
+    if (!message) continue;
 
-    const items = messageToResponseItems(entry.message);
+    const items = messageToResponseItems(message);
     if (items.length === 0) continue;
 
-    if (entry.message.role === "assistant") {
-      if (assistantMessageMatchesModelKey(entry.message, latestDetails.modelKey)) {
+    if (message.role === "assistant") {
+      if (assistantMessageMatchesModelKey(message, latestDetails.modelKey)) {
         trailingMessages.push(...pendingTurnItems, ...items);
       }
       pendingTurnItems = [];
@@ -1062,6 +1179,9 @@ export function reconstructRemoteCompactionStateFromBranch(params: {
 
     pendingTurnItems.push(...items);
   }
+
+  // Preserve a newly appended user/custom turn before its assistant reply exists.
+  trailingMessages.push(...pendingTurnItems);
 
   return {
     compactionEntryId: latestCompactionEntryId,

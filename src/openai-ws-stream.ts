@@ -20,8 +20,8 @@ import {
   type TextContent,
   type ToolCall,
   type Usage,
-  type StreamFunction,
 } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { streamSimpleOpenAIResponses } from "@earendil-works/pi-ai/compat";
 import { loadConfig } from "./config.ts";
 import {
@@ -531,7 +531,7 @@ function buildAssistantMessageFromResponse(
         name: toolName,
         arguments: (() => {
           try {
-            return JSON.parse(item.arguments) as Record<string, unknown>;
+            return JSON.parse(item.arguments) as ToolCall["arguments"];
           } catch {
             return {};
           }
@@ -757,7 +757,7 @@ async function fallbackToHttp(
       return chained ?? nextPayload;
     },
   } satisfies SimpleStreamOptions | undefined;
-  const httpStream = streamSimpleOpenAIResponses(model, context, mergedOptions);
+  const httpStream = streamSimpleOpenAIResponses(model, normalizeContext(context), mergedOptions);
   for await (const event of httpStream) {
     eventStream.push(event);
   }
@@ -775,7 +775,7 @@ async function fallbackToHttpResponses(
 
 export function createOpenAIWebSocketStreamFn(
   managerOptions: OpenAIWebSocketManagerOptions = {},
-): StreamFunction {
+): (model: Model<any>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const eventStream = createEventStream();
 

@@ -1,212 +1,89 @@
-# pi-openai-server-compaction
+# pi-openai-server-compaction — Pi 0.99 compatibility fork
 
-This is a Pi extension which adds **Codex-style remote compaction** for OpenAI models, giving you better continuity across compaction boundaries while preserving all of Pi's normal features.
+A compatibility patch for [algal/pi-openai-server-compaction](https://github.com/algal/pi-openai-server-compaction), based on upstream commit `8a3de2f3b0c178fdd6f73f2f94172dfc3943e466`.
 
-What does that mean? Why would you want it? My impression has been that Codex compacts better than Claude Code and better than Pi. And I supposed this was because Codex compacts by using OpenAI's server-side Responses compaction protocol. That protocol sends a `compaction_trigger` through `POST /v1/responses` and receives an encrypted `compaction` item. This extension configures Pi to use that protocol for OpenAI models alongside Pi's native compaction logic.
+## What changes
 
-But is Codex's compaction _actually_ better? Since the OpenAI compaction endpoint compacts to encrypted binary blobs, no one can say what it is doing under the hood. However, we don't need to know how it works to determine if it works better. Anyone can call the endpoint. And since codex is an open source, we can mimic exactly how codex itself uses the endpoint. That is what this extension configures Pi to do.
+- Normal requests retain Pi's built-in transport and use `store: false`.
+- OpenAI ChatGPT subscription OAuth uses inline `context_management` compaction through `/v1/responses`. It sends no `compaction_trigger` and does not call `/responses/compact`.
+- API-key and legacy `openai-codex` compaction retain upstream's v2 path. These paths were not live-tested by this patch.
+- Encrypted compaction state is replayed through Pi's native request hook. Current system instructions and tool definitions are retained.
+- Portable summaries use Pi's authenticated model registry. Provider errors are treated as failures rather than successful empty summaries.
+- `/openai-compaction-status` shows readiness and whether remote history has been loaded.
+- Extension notes, bash context, branch summaries, and unanswered turns survive remote history replay. The persisted branch is reconciled before requests and compaction.
+- Pi receives combined summary and remote-compaction usage for its session statistics.
 
-So is native compaction better? For the user-facing comparison I care about,
-the evidence says yes, with important price and reliability qualifiers. A
-held-out benchmark of the real product defaults found 78.0% exact recall for
-this extension's native policy versus 48.0% for Pi's default compactor; full
-context scored 100%. Native did this while emitting 4.58x as many compaction
-output tokens and leaving a 29% larger billed downstream context. It preserved
-much more old state, but this is not evidence that it is better at the same
-token budget.
-Native was also highly variable: every large artifact scored perfectly, while
-three small artifacts performed about as poorly as Pi.
+## Why the original failed in this installation
 
-Strictly, this directly compares Pi with this extension's reconstruction of
-Codex-style compaction, not with an end-to-end run of the Codex CLI. The result
-also does not show that the endpoint reliably detects when more capacity is
-needed: its short artifacts were the failures. What it does show is that the
-native default sometimes allocates far more context, and those large-allocation
-runs drove its aggregate advantage.
+The installed Pi version was 0.99.1; upstream declares `>=0.80.9 <0.81.0`. Session logs recorded custom WebSocket errors and HTTP 400 `Store must be set to false`. Direct synthetic probes with the installation's OpenAI subscription login returned:
 
-An earlier benchmark reported 100% native recall versus 82.8% and 76.7% for two
-text summaries at apparently matched downstream sizes. That procedure first
-observed native's output usage and then imposed it as the text arm's maximum,
-which is asymmetric and can favor native. Its same-budget interpretation is
-therefore superseded. See the new [product-defaults report](benchmarks/product-defaults/REPORT.md)
-and [reproduction instructions](benchmarks/product-defaults/README.md). The
-[older matched-cap report](benchmarks/native-vs-text/REPORT.md) remains retained
-with a methodological correction.
+- `compaction_trigger`: HTTP 400, `subscription_sharing_unsupported_capability`.
+- `/responses/compact`: HTTP 401, `hardened_oauth_rule_missing`.
+- Inline `context_management`: HTTP 200 with encrypted `compaction` output items.
 
-None of this proves the encrypted blobs use a clever latent-space
-representation. They might be encrypted optimized text or structured state
-values. (A little reverse engineering suggests the blobs are produced through
-a textual prompt, for what it is worth:
-https://x.com/alexisgallagher/status/2042396986327060736?s=20 .)
-
-> **Status:** experimental but live-tested against real Pi + real OpenAI backends.
-> Recommended rollout: install project-local first, use for a week, keep rollback easy.
-
-## Support matrix
-
-| Provider/model family | Remote compaction           | `previous_response_id` continuity | Custom WS stream                 | Live-tested |
-|-----------------------|-----------------------------|-----------------------------------|----------------------------------|-------------|
-| `openai/*`            | Yes                         | Yes                               | Yes                              | Yes         |
-| `openai-codex/*`      | Yes                         | No (built-in transport retained)  | No (built-in transport retained) | Yes         |
-| Azure                 | Partial (opt-in via config) | Partial                           | No                               | No          |
+These are observations from this installation on 2026-09-30, not a claim about every OpenAI authentication method.
 
 ## Install
 
-Project-local (recommended):
-
-```bash
-pi install -l git:github.com/algal/pi-openai-server-compaction
+```sh
+pi install git:github.com/delirious6423/pi-openai-server-compaction
 ```
 
-Global:
+Remove any earlier upstream or local installation of this extension before loading the fork, so only one copy is active. Requirements: Node 22 or newer and Pi `>=0.99.1 <0.100.0`; Pi 0.99.1 is the tested version.
 
-```bash
-pi install git:github.com/algal/pi-openai-server-compaction
+For a local checkout:
+
+Unpack the source archive, then run:
+
+```sh
+cd /path/to/pi-openai-server-compaction
+npm install --omit=dev --ignore-scripts
+pi remove git:github.com/algal/pi-openai-server-compaction
+pi install /absolute/path/to/pi-openai-server-compaction
 ```
 
-One-shot, non-persistent:
-
-```bash
-git clone https://github.com/algal/pi-openai-server-compaction.git
-cd pi-openai-server-compaction && npm install
-pi -e ./src/index.ts --model openai/gpt-5.6-luna
-```
-
-## Requirements
-
-- Node `>= 22`
-- Pi `>=0.80.9 <0.81.0`
-- Auth/config for the model you want to use must already work in Pi
-- A supported OpenAI Responses model, e.g. `openai/gpt-5.6-sol` or `openai-codex/gpt-5.6-sol`
-
-## What it does
-
-On compaction, the extension requests Responses compaction v2 through `/v1/responses` in parallel with generating a portable Pi text summary. This gives you both:
-
-- **An OpenAI-native opaque compaction artifact** for high-fidelity continuity on compatible future turns
-- **A portable Pi text summary** so non-OpenAI models, session exports, forking, and tree navigation keep working
-
-For direct `openai/*` models between compactions, the extension also:
-
-- Patches requests with `store: true` and `context_management`
-- Uses `previous_response_id` for live continuation when safe
-- Provides a WebSocket-backed transport path with HTTP fallback
-
-For `openai-codex/*` models, the extension preserves the built-in Codex transport and only injects reconstructed remote compaction history after compaction boundaries.
-
-## How compaction works
-
-On Pi compaction events for supported models, the extension:
-
-1. Generates a **portable Pi text summary** (full-branch summary with fallback to Pi's built-in compaction helper)
-2. Calls `POST /v1/responses` with the conversation history, a trailing `compaction_trigger`, system prompt, tools, reasoning config, and text config
-3. Retains recent user messages and stores them with the returned opaque `compaction` item in `CompactionEntry.details.remoteCompaction`
-4. Persists remote compaction usage metadata when the backend returns it
-
-The compaction request mirrors the shape of surrounding normal requests (reasoning effort, text settings, tool definitions) rather than using endpoint defaults.
-
-## Safety
-
-The extension clears live continuation state on: session start/reload/resume, switch/fork, tree navigation, compaction completion, model selection, and shutdown.
-
-Remote compaction history is only replayed for compatible models. Cross-model turns are filtered from reconstructed replay history to prevent contamination after resume or tree navigation.
-
-## Data handling
-
-Users should be aware:
-
-- For direct `openai/*` models, the extension sets `store: true` on requests, meaning OpenAI retains conversation data server-side
-- Conversation context is sent to OpenAI's Responses compaction protocol
-- Returned opaque compaction artifacts are stored in Pi's local session JSONL
-- These artifacts are provider-native and not human-readable
-
-## Configuration
-
-Config is read from:
-
-- `~/.pi/agent/openai-server-compaction.json` (global)
-- `.pi/openai-server-compaction.json` (project-local, takes precedence)
+Use this configuration in `~/.pi/agent/openai-server-compaction.json`:
 
 ```json
 {
   "enabled": true,
-  "includeAzure": false,
-  "thresholdRatio": 0.7,
-  "compactThreshold": 0,
-  "usePreviousResponseId": true,
-  "notify": false
+  "useCustomTransport": false,
+  "usePreviousResponseId": false,
+  "notify": true
 }
 ```
 
-Environment overrides:
+Restart Pi, then run `/openai-compaction-status`. `/compact` requests compaction for a sufficiently long session. Pi also uses the same hook for its normal automatic compaction.
 
-| Variable                                           | Effect                                                      |
-|----------------------------------------------------|-------------------------------------------------------------|
-| `PI_OPENAI_SERVER_COMPACTION_ENABLED`              | Enable/disable the extension                                |
-| `PI_OPENAI_SERVER_COMPACTION_AZURE`                | Include Azure OpenAI models                                 |
-| `PI_OPENAI_SERVER_COMPACTION_THRESHOLD`            | Explicit compact threshold (tokens)                         |
-| `PI_OPENAI_SERVER_COMPACTION_RATIO`                | Compact threshold as ratio of context window (default: 0.7) |
-| `PI_OPENAI_SERVER_COMPACTION_PREVIOUS_RESPONSE_ID` | Enable/disable `previous_response_id`                       |
-| `PI_OPENAI_SERVER_COMPACTION_NOTIFY`               | Show UI notifications when features activate                |
+`PI_CODING_AGENT_DIR` is respected. Project `.pi/openai-server-compaction.json` and environment overrides take precedence.
 
-## Troubleshooting
+## Validation
 
-If something goes wrong:
+Validated against Pi 0.99.1, Node 22.23.3, and `openai/gpt-5.5` with a ChatGPT subscription OAuth login on 2026-09-30:
 
-1. **Quick disable:** set `PI_OPENAI_SERVER_COMPACTION_ENABLED=0` or add `"enabled": false` to config
-2. **Bypass entirely:** run Pi with `--no-extensions`
-3. **Reload:** run `/reload` in Pi to re-initialize extensions
-4. **Uninstall:** `pi remove pi-openai-server-compaction`
-5. **Inspect:** check your session JSONL for `compaction` entries with `details.remoteCompaction` to see if remote compaction was recorded
+- TypeScript type checking passed.
+- Upstream offline smoke suite passed.
+- 17 compatibility tests passed.
+- A live synthetic conversation passed normal replies, a `read` tool call, encrypted remote compaction, a portable summary, exact code recall after compaction, and resume from a persisted session.
+- Captured ordinary requests used `store: false`, no `previous_response_id`, and retained system messages and `read` tool definitions after compaction and resume.
+- A second live compaction retained an idle extension note; extension note recall passed after both compaction and resume. Top-level compaction usage was present.
 
-## Testing
+This is a functional regression test, not a benchmark of long-session recall quality or a validation of all models and providers. Inline compaction may emit more than one artifact; this patch replays the latest one together with upstream's retained user-message policy. If no artifact is returned, the portable summary remains available.
 
-Smoke test (offline, verifies imports and key algorithms):
-
-```bash
-npm run smoke
+```sh
+npm install --ignore-scripts
+npm test
+# Makes real provider requests, using only a new synthetic session:
+npm run test:live:compat
 ```
 
-Live end-to-end test (requires working Pi + OpenAI auth):
+The live test copies credentials into a private temporary agent directory and removes that credential copy in its cleanup. It never loads an existing user conversation.
 
-```bash
-npm run test:live
-```
+The legacy custom WebSocket path is an optional API-key-only mode (`useCustomTransport: true`). The default and tested configuration is Pi native transport.
 
-Override the test model:
+## References
 
-```bash
-PI_OPENAI_SERVER_COMPACTION_TEST_MODEL=openai-codex/gpt-5.6-sol npm run test:live
-```
-
-## Limitations
-
-- Pi's local JSONL/tree model remains authoritative
-- Opaque remote compaction artifacts are only reused for compatible OpenAI Responses turns
-- Switching to a different provider/model falls back to Pi's text-summary portability path
-- Compaction usage/cost is captured in details but not yet folded into Pi's `get_session_stats()` (requires Pi core changes)
-
-## Repo layout
-
-| File                                       | Purpose                                                           |
-|--------------------------------------------|-------------------------------------------------------------------|
-| `src/index.ts`                             | Extension wiring, compaction hook, lifecycle handling             |
-| `src/remote-compaction.ts`                 | Responses compaction v2 integration and replacement-history handling |
-| `src/openai-ws-stream.ts`                  | WebSocket continuation path                                       |
-| `src/openai-ws-connection.ts`              | WebSocket connection manager                                      |
-| `src/openai.ts`                            | Model detection and payload patching                              |
-| `src/custom-stream.ts`                     | Provider override entrypoint                                      |
-| `src/config.ts`                            | Configuration loading                                             |
-| `src/state.ts`                             | Ephemeral per-session runtime state                               |
-| `src/stream-message-shared.ts`             | Shared assistant message builders                                 |
-| `tests/live/openai-compaction-rpc-live.ts` | Live Pi RPC regression test                                       |
-| `scripts/smoke.mjs`                        | Offline smoke test with peer-package bootstrapping                |
-| `benchmarks/product-defaults/`             | Current default-vs-default benchmark, retained evidence, and report |
-| `benchmarks/native-vs-text/`               | Earlier matched-cap benchmark, retained with a correction          |
-| `ARCHITECTURE.md`                          | Design and control-flow documentation                             |
-| `TESTPLAN.md`                              | Manual and automated test plan                                    |
-| `CHANGELOG.md`                             | Version history                                                   |
-
-## License
-
-MIT. See `LICENSE.md`.
+- [Upstream issue and PR review](UPSTREAM_REVIEW.md), including attribution for the context-preservation fixes from kunchenguid and Christian-Martensson and usage reporting from ronind.
+- [OpenAI compaction guide](https://developers.openai.com/api/docs/guides/compaction)
+- `README.upstream.md` and the benchmark directories retain upstream documentation and historical results. Their transport defaults describe the original version.
+- MIT license: `LICENSE.md`.

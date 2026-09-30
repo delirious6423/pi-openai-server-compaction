@@ -114,14 +114,19 @@ export function applyPayloadPatch(params: {
   model: ModelLike;
   cfg: Required<ExtensionConfig>;
   previousResponseId?: string;
+  stateless?: boolean;
+  contextManagement?: boolean;
 }): JsonRecord {
   const nextPayload: JsonRecord = { ...params.payload };
 
-  if (supportsStore(params.model)) {
+  if (params.stateless) {
+    nextPayload.store = false;
+    delete nextPayload.previous_response_id;
+  } else if (supportsStore(params.model)) {
     nextPayload.store = true;
   }
 
-  if (nextPayload.context_management === undefined) {
+  if (params.contextManagement !== false && nextPayload.context_management === undefined) {
     nextPayload.context_management = [
       {
         type: "compaction",
@@ -131,6 +136,7 @@ export function applyPayloadPatch(params: {
   }
 
   if (
+    !params.stateless &&
     params.cfg.usePreviousResponseId &&
     params.previousResponseId &&
     nextPayload.previous_response_id === undefined
@@ -156,9 +162,13 @@ export function applyRemoteHistoryPayloadPatch(params: {
   payload: JsonRecord;
   explicitHistory: unknown[];
 }): JsonRecord {
+  // Native Pi Responses requests carry the system prompt as input messages.
+  const systemItems = Array.isArray(params.payload.input)
+    ? params.payload.input.filter((item) => isRecord(item) && (item.role === "system" || item.role === "developer"))
+    : [];
   const nextPayload: JsonRecord = {
     ...params.payload,
-    input: params.explicitHistory,
+    input: [...systemItems, ...params.explicitHistory],
   };
   delete nextPayload.messages;
   delete nextPayload.previous_response_id;

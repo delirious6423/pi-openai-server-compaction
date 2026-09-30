@@ -1,0 +1,98 @@
+{
+  "status": "passed",
+  "model": "gpt-5.5",
+  "checks": [
+    "normal turn",
+    "read tool",
+    "encrypted remote compaction",
+    "portable summary",
+    "post-compaction recall",
+    "session resume",
+    "system prompt and tools retained",
+    "stateless requests",
+    "extension note after compaction",
+    "idle note before second compaction",
+    "extension note after resume",
+    "top-level compaction usage"
+  ],
+  "requests": [
+    {
+      "store": false,
+      "previousResponse": false,
+      "remoteHistory": false,
+      "systemMessages": 1,
+      "tools": [
+        "read"
+      ]
+    },
+    {
+      "store": false,
+      "previousResponse": false,
+      "remoteHistory": false,
+      "systemMessages": 1,
+      "tools": [
+        "read"
+      ]
+    },
+    {
+      "store": false,
+      "previousResponse": false,
+      "remoteHistory": false,
+      "systemMessages": 1,
+      "tools": [
+        "read"
+      ]
+    },
+    {
+      "store": false,
+      "previousResponse": false,
+      "remoteHistory": true,
+      "systemMessages": 1,
+      "tools": [
+        "read"
+      ]
+    },
+    {
+      "store": false,
+      "previousResponse": false,
+      "remoteHistory": true,
+      "systemMessages": 1,
+      "tools": [
+        "read"
+      ]
+    },
+    {
+      "store": false,
+      "previousResponse": false,
+      "remoteHistory": true,
+      "systemMessages": 1,
+      "tools": [
+        "read"
+      ]
+    },
+    {
+      "store": false,
+      "previousResponse": false,
+      "remoteHistory": true,
+      "systemMessages": 1,
+      "tools": [
+        "read"
+      ]
+    },
+    {
+      "store": false,
+      "previousResponse": false,
+      "remoteHistory": true,
+      "systemMessages": 1,
+      "tools": [
+        "read"
+      ]
+    }
+  ],
+  "date": "2026-09-30",
+  "piVersion": "0.99.1",
+  "nodeVersion": "22.23.3",
+  "forkVersion": "0.1.2",
+  "offlineCompatibilityTests": 17,
+  "protocol": "responses_inline_compaction"
+}
